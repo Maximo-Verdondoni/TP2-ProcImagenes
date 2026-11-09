@@ -14,6 +14,10 @@ Pipeline general de detectar_patente():
     6. Validación interna: dentro de cada candidato se cuentan los componentes
        con forma de carácter alineados en una fila. Gana el candidato con
        ~6 caracteres alineados y mayor energía de bordes.
+    7. Verificación y respaldo: el ganador se confirma segmentando sus caracteres
+       con paso2.py. Si no aparecen al menos 4, se repite la búsqueda con un
+       filtro geométrico relajado (para patentes fusionadas con la parrilla,
+       como en img04) y el recuadro se ajusta a la fila de caracteres.
 
 Para hacerlo más robusto se prueban 2 umbrales x 2 tamaños de clausura y se
 juntan todos los candidatos antes de elegir el ganador.
@@ -46,6 +50,9 @@ def _contar_caracteres_internos(roi_gray):
         cantidad    : tamaño del grupo más grande de caracteres alineados.
         uniformidad : 1 / (1 + desvío de las alturas del grupo). Vale 1 si todos
                       miden lo mismo y baja cuanto más dispares sean.
+    Es un contador rápido y aproximado: a resolución original y con la patente
+    torcida suele contar menos caracteres de los reales. Alcanza para ordenar
+    candidatos; la verificación fina la hace segmentar_caracteres (paso2.py).
     """
     rh, rw = roi_gray.shape
 
@@ -110,6 +117,45 @@ def _contar_caracteres_internos(roi_gray):
     return mejor_grupo, uniformidad
 
 
+def _bbox_desde_caracteres(seg, bbox, W, H, esc):
+    """
+    Recuadro de la patente a partir de la fila de caracteres que encontró
+    segmentar_caracteres (paso2.py). Esa fila está en coordenadas del recorte
+    ESCALADO y ENDEREZADO, así que hay que deshacer las dos cosas (Unidad 4.4):
+        1. rotación: se aplica la transformación afín inversa
+        2. escalado: se divide por el factor esc y se suma la posición del recorte
+    Se agrega un margen proporcional a la altura de las letras (30% a los costados,
+    45% arriba y abajo) para que entre la chapa completa.
+    Devuelve (x, y, w, h) en coordenadas de la imagen.
+    """
+    x, y, _, _ = bbox
+    rh, rw = seg["roi_rot"].shape
+    # Misma rotación que usó paso2, invertida
+    M = cv2.getRotationMatrix2D((rw / 2, rh / 2), seg["angulo"], 1.0)
+    M_inv = cv2.invertAffineTransform(M)
+
+    # Rectángulo de la fila de caracteres (en el recorte enderezado) + margen
+    fx0 = min(c[0] for c in seg["chars"])
+    fx1 = max(c[0] + c[2] for c in seg["chars"])
+    fy0 = min(c[1] for c in seg["chars"])
+    fy1 = max(c[1] + c[3] for c in seg["chars"])
+    alto = fy1 - fy0
+    mx, my = 0.3 * alto, 0.45 * alto
+    esquinas = np.array([[fx0 - mx, fy0 - my], [fx1 + mx, fy0 - my],
+                         [fx1 + mx, fy1 + my], [fx0 - mx, fy1 + my]], dtype=np.float64)
+
+    # Deshacer rotación (p = M_inv * [q, 1]) y escalado, y sumar la posición del recorte
+    orig = esquinas @ M_inv[:, :2].T + M_inv[:, 2]
+    orig = orig / esc + np.array([x, y])
+
+    # Rectángulo alineado a los ejes que encierra las 4 esquinas, dentro de la imagen
+    bx0, by0 = np.floor(orig.min(axis=0)).astype(int)
+    bx1, by1 = np.ceil(orig.max(axis=0)).astype(int)
+    bx0, by0 = max(0, int(bx0)), max(0, int(by0))
+    bx1, by1 = min(W, int(bx1)), min(H, int(by1))
+    return (bx0, by0, bx1 - bx0, by1 - by0)
+
+
 def detectar_patente(img_bgr):
     """
     Punto 2.A: detecta la patente en una imagen de un vehículo.
@@ -128,6 +174,7 @@ def detectar_patente(img_bgr):
         mask_morf  : máscara tras clausura + apertura de esa combinación
         bbox       : (x, y, w, h) de la patente detectada, o None
         candidatos : lista de (score, n_chars, bbox, mask_morf, mask_bin)
+        usa_respaldo : True si la patente salió de la búsqueda de respaldo (paso 7)
     """
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     H, W = gray.shape
@@ -150,42 +197,54 @@ def detectar_patente(img_bgr):
 
     # 3. Umbralizado + morfología, probando 2 x 2 combinaciones (Unidades 3.1 y 6.3).
     #    - Umbral: Otsu y 1.35 * Otsu. El más alto deja menos bordes y evita que,
-    #      en autos con parrilla pegada a la patente (img04, img06), ambas se
-    #      fusionen en un solo bloque.
+    #      en autos con parrilla pegada a la patente (img06), ambas se fusionen
+    #      en un solo bloque. Cuando igual se fusionan (img04), lo resuelve el
+    #      respaldo del paso 7.
     #    - Clausura horizontal de 15 o 21 px de ancho: une los bordes de los
     #      caracteres en un rectángulo continuo.
     #    - Apertura de 5x3: elimina restos chicos y conexiones finas.
     t_otsu, _ = cv2.threshold(abs_gx, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    candidatos = []
 
-    for factor_t in (1.0, 1.35):
-        _, mask_bin = cv2.threshold(abs_gx, int(min(250, t_otsu * factor_t)), 255,
-                                    cv2.THRESH_BINARY)
-        for ancho_close in (15, 21):
-            se_close = cv2.getStructuringElement(cv2.MORPH_RECT, (ancho_close, 3))
-            se_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
-            m_morf = cv2.morphologyEx(mask_bin, cv2.MORPH_CLOSE, se_close)
-            m_morf = cv2.morphologyEx(m_morf, cv2.MORPH_OPEN, se_open)
+    def buscar_candidatos(relajado):
+        """Recorre las 2 x 2 combinaciones de umbral y clausura y devuelve los
+        candidatos a patente. Con relajado=True se usa el modo de respaldo
+        (ver paso 7 más abajo)."""
+        cands = []
+        for factor_t in (1.0, 1.35):
+            _, mask_bin = cv2.threshold(abs_gx, int(min(250, t_otsu * factor_t)), 255,
+                                        cv2.THRESH_BINARY)
+            for ancho_close in (15, 21):
+                se_close = cv2.getStructuringElement(cv2.MORPH_RECT, (ancho_close, 3))
+                se_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
+                m_morf = cv2.morphologyEx(mask_bin, cv2.MORPH_CLOSE, se_close)
+                m_morf = cv2.morphologyEx(m_morf, cv2.MORPH_OPEN, se_open)
 
-            # 4. Componentes conectados (Unidad 3.3): cada bloque es un candidato
-            n, _, stats, _ = cv2.connectedComponentsWithStats(m_morf, connectivity=8)
-            for i in range(1, n):  # i = 0 es el fondo
-                x, y, w, h, area = stats[i]
-                ar = w / float(h)              # relación de aspecto
-                extent = area / float(w * h)   # qué tan "lleno" está el rectángulo
+                # 4. Componentes conectados (Unidad 3.3): cada bloque es un candidato
+                n, _, stats, _ = cv2.connectedComponentsWithStats(m_morf, connectivity=8)
+                for i in range(1, n):  # i = 0 es el fondo
+                    x, y, w, h, area = stats[i]
+                    ar = w / float(h)              # relación de aspecto
+                    extent = area / float(w * h)   # qué tan "lleno" está el rectángulo
 
-                # 5. Filtro geométrico de placa (Unidad 7.2):
-                #    - relación de aspecto entre 1.65 y 5.5 (rectángulo apaisado)
-                #    - ancho entre 35 y 122 px y alto entre 11 y 65 px
-                #    - extent > 0.35: el bloque debe llenar bien su rectángulo
-                #    - y > 0.25*H: descarta estructuras altas (techo, parabrisas)
-                if (
-                    1.65 <= ar <= 5.5
-                    and 35 <= w <= 122
-                    and 11 <= h <= 65
-                    and extent > 0.35
-                    and y > 0.25 * H
-                ):
+                    # 5. Filtro geométrico de placa (Unidad 7.2):
+                    #    Normal:
+                    #    - relación de aspecto entre 1.65 y 5.5 (rectángulo apaisado)
+                    #    - ancho entre 35 y 122 px y alto entre 11 y 65 px
+                    #    - extent > 0.35: el bloque debe llenar bien su rectángulo
+                    #    - y > 0.25*H: descarta estructuras altas (techo, parabrisas)
+                    #    Relajado (respaldo): admite bloques más grandes, como una
+                    #    patente fusionada con la parrilla (img04).
+                    if relajado:
+                        ok_geom = (1.5 <= ar <= 6.0 and 35 <= w <= 0.35 * W
+                                   and 11 <= h <= 0.25 * H and extent > 0.30
+                                   and y > 0.25 * H)
+                    else:
+                        ok_geom = (1.65 <= ar <= 5.5 and 35 <= w <= 122
+                                   and 11 <= h <= 65 and extent > 0.35
+                                   and y > 0.25 * H)
+                    if not ok_geom:
+                        continue
+
                     # Se agrega un pequeño margen al recuadro para que los
                     # caracteres de los extremos queden completos al validar
                     px, py = max(2, int(0.05 * w)), max(2, int(0.15 * h))
@@ -197,6 +256,7 @@ def detectar_patente(img_bgr):
 
                     # 6. Validación interna: ¿hay una fila de caracteres adentro?
                     n_chars, unif = _contar_caracteres_internos(roi_g)
+                    bbox_cand = (x0, y0, x1 - x0, y1 - y0)
 
                     # Energía media de bordes verticales dentro del candidato
                     energia_gx = float(np.mean(roi_gx))
@@ -207,12 +267,45 @@ def detectar_patente(img_bgr):
                     # estos tengan más energía de bordes. Si n_chars = 0, score = 0.
                     bonus_chars = (min(n_chars, 6) ** 2.5) * (1.0 + unif)
                     score = bonus_chars * energia_gx
-                    candidatos.append((score, n_chars, (x0, y0, x1 - x0, y1 - y0),
-                                       m_morf, mask_bin))
+                    cands.append((score, n_chars, bbox_cand, m_morf, mask_bin))
+        return cands
 
-    # Elección del ganador: el candidato de mayor puntaje entre todas las combinaciones
-    if candidatos:
-        mejor = max(candidatos, key=lambda c: c[0])
+    # Búsqueda normal
+    candidatos = buscar_candidatos(relajado=False)
+    mejor = max(candidatos, key=lambda c: c[0]) if candidatos else None
+
+    # 7. Verificación y respaldo.
+    #    El ganador se verifica con la segmentación de caracteres del punto B
+    #    (paso2.py: escalado x3, enderezado, limpieza del marco), que es mucho más
+    #    confiable que el contador rápido de arriba. Si encuentra al menos 4
+    #    caracteres, el ganador se confirma (es lo que pasa en 11 de las 12 imágenes).
+    #    Si no, la detección falló: en img04 ganaba un pedazo de piso porque la
+    #    patente se fusionó con la parrilla y no pasó el filtro de tamaño. Entonces
+    #    se repite la búsqueda con el filtro relajado, se cuentan los caracteres de
+    #    cada candidato con paso2 y gana el que tenga una fila de 4 a 6 caracteres
+    #    (a igualdad, el de mayor puntaje). Su recuadro se ajusta a esa fila, para
+    #    dejar afuera la parrilla.
+    #    El import va acá adentro porque paso2 importa a paso1 (import circular).
+    from paso2 import segmentar_caracteres, ESC
+
+    usa_respaldo = False
+    if mejor is None or len(segmentar_caracteres(gray, mejor[2])["chars"]) < 4:
+        respaldo = buscar_candidatos(relajado=True)
+        evaluados = []
+        for c in respaldo:
+            seg = segmentar_caracteres(gray, c[2])
+            if len(seg["chars"]) >= 4:
+                evaluados.append((min(len(seg["chars"]), 6), c[0], c, seg))
+        if evaluados:
+            n_ok, _, c, seg = max(evaluados, key=lambda e: (e[0], e[1]))
+            bbox_ajustado = _bbox_desde_caracteres(seg, c[2], W, H, ESC)
+            mejor = (c[0], n_ok, bbox_ajustado, c[3], c[4])
+            candidatos += respaldo
+            candidatos.append(mejor)
+            usa_respaldo = True
+
+    # Resultado final: el ganador de la búsqueda normal, o el del respaldo si se usó
+    if mejor is not None:
         bbox_final = mejor[2]
         mask_morf_final = mejor[3]
         mask_bin_final = mejor[4]
@@ -229,6 +322,7 @@ def detectar_patente(img_bgr):
         mask_morf=mask_morf_final,
         bbox=bbox_final,
         candidatos=candidatos,
+        usa_respaldo=usa_respaldo,
     )
 
 
@@ -249,11 +343,14 @@ if __name__ == "__main__":
 
         # Informe por consola del resultado de cada imagen
         if res["bbox"] is not None:
-            mejor = max(res["candidatos"], key=lambda c: c[0])
             x, y, w, h = res["bbox"]
+            # El ganador es el candidato cuyo recuadro coincide con el bbox final
+            # (con respaldo, no tiene por qué ser el de mayor puntaje de la lista completa)
+            mejor = next(c for c in res["candidatos"] if c[2] == res["bbox"])
             print(f"{nombre:10s}: {len(res['candidatos']):2d} candidatos | ganador: "
                   f"score={mejor[0]:7.1f}, caracteres={mejor[1]} | "
-                  f"bbox=({x},{y},{w},{h}), AR={w/h:.2f}")
+                  f"bbox=({x},{y},{w},{h}), AR={w/h:.2f}"
+                  + (" | RESPALDO" if res["usa_respaldo"] else ""))
             recorte = img_rgb[y:y + h, x:x + w]
         else:
             print(f"{nombre:10s}: {len(res['candidatos']):2d} candidatos | SIN DETECTAR")
